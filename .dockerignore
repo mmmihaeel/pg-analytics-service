@@ -1,0 +1,9 @@
+.git
+.github
+bin
+coverage
+*.out
+*.log
+.env
+postgres-data
+redis-data

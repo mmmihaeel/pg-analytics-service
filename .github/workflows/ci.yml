@@ -1,0 +1,78 @@
+name: ci
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: pg_analytics
+          POSTGRES_USER: app
+          POSTGRES_PASSWORD: app
+        ports:
+          - 5436:5432
+        options: >-
+          --health-cmd="pg_isready -U app -d pg_analytics"
+          --health-interval=5s
+          --health-timeout=3s
+          --health-retries=20
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6383:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=5s
+          --health-timeout=3s
+          --health-retries=20
+
+    env:
+      DATABASE_URL: postgres://app:app@localhost:5436/pg_analytics?sslmode=disable
+      REDIS_URL: redis://localhost:6383/0
+      MANAGEMENT_API_KEY: ci-management-key
+      APP_AUTO_MIGRATE: "false"
+      APP_AUTO_SEED: "false"
+      MAX_REPORT_RANGE_DAYS: "366"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Check formatting
+        run: |
+          UNFORMATTED=$(gofmt -l $(find . -name '*.go' -not -path './vendor/*'))
+          if [ -n "$UNFORMATTED" ]; then
+            echo "The following files need gofmt:"
+            echo "$UNFORMATTED"
+            exit 1
+          fi
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v1.64.6
+
+      - name: Run tests
+        run: go test ./... -count=1
+
+      - name: Build
+        run: go build ./...
+
+      - name: Validate docker compose
+        run: docker compose config
