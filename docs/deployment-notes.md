@@ -1,61 +1,84 @@
 # Deployment Notes
 
-## Container Images
+The repository is local-first, but the runtime shape is production-minded enough to document clearly: build a static Go binary, run it with PostgreSQL and Redis, control startup behavior through env vars, and be explicit about where durability starts and stops.
 
-The Dockerfile provides:
+## Related Docs
 
-- `dev` stage for local workflow (Go toolchain available)
-- `build` stage for static binary compilation
-- `runtime` stage (distroless) for minimal production image
+- [README](../README.md)
+- [Architecture](architecture.md)
+- [Security](security.md)
+
+## Image Strategy
+
+`docker/go/Dockerfile` defines three stages:
+
+| Stage | Purpose |
+| --- | --- |
+| `dev` | Compose-oriented local development image with Go tooling available |
+| `build` | Compiles the Linux AMD64 binary with `CGO_ENABLED=0` |
+| `runtime` | Minimal distroless image that runs only the compiled service binary |
+
+Compose currently uses the `dev` target because the local workflow is source-mounted and build-tool-driven. A deployment pipeline would typically build and run the `runtime` stage instead.
 
 ## Runtime Configuration
 
-Required environment variables:
+| Variable | Required | Default | Purpose |
+| --- | --- | --- | --- |
+| `DATABASE_URL` | Yes | none | PostgreSQL connection string |
+| `REDIS_URL` | Yes | none | Redis connection string |
+| `MANAGEMENT_API_KEY` | Yes in practice | `change-me` | Shared key for protected endpoints |
+| `APP_ENV` | No | `development` | Environment label used in logs and startup context |
+| `APP_PORT` | No | `3004` | HTTP listen port |
+| `APP_VERSION` | No | `dev` | Version surfaced by `/api/v1/health` |
+| `APP_AUTO_MIGRATE` | No | `true` | Apply migrations during API startup |
+| `APP_AUTO_SEED` | No | `false` | Seed demo data during API startup |
+| `MAX_REPORT_RANGE_DAYS` | No | `366` | Upper bound for report execution and recompute range |
+| `RECOMPUTE_LOCK_TTL` | No | `15m` | Expiry for Redis recompute locks |
+| `RECOMPUTE_WORKERS` | No | `1` | Number of worker goroutines consuming the queue |
+| `RECOMPUTE_QUEUE_SIZE` | No | `64` | Buffered in-process queue depth |
+| `HTTP_READ_TIMEOUT` | No | `10s` | Server read timeout |
+| `HTTP_WRITE_TIMEOUT` | No | `20s` | Server write timeout |
+| `HTTP_SHUTDOWN_TIMEOUT` | No | `15s` | Graceful shutdown timeout |
 
-- `DATABASE_URL`
-- `REDIS_URL`
-- `MANAGEMENT_API_KEY`
+## Deployment Guidance
 
-Recommended runtime variables:
+For production-like environments:
 
-- `MAX_REPORT_RANGE_DAYS`
-- `RECOMPUTE_LOCK_TTL`
-- `RECOMPUTE_WORKERS`
-- `RECOMPUTE_QUEUE_SIZE`
+- run migrations explicitly with `go run ./cmd/migrate` or an equivalent migration step in the release pipeline
+- keep `APP_AUTO_SEED=false`
+- treat the fallback `MANAGEMENT_API_KEY=change-me` as invalid and always provide a real secret
+- wire health checks to `GET /api/v1/health`
+- persist PostgreSQL storage and treat Redis data as disposable
 
-## Data-Store Roles
+## Scaling and Durability
 
-- PostgreSQL:
-  - source events
-  - snapshot aggregates
-  - recompute run lifecycle
-  - audit history
-- Redis:
-  - report response cache
-  - recompute lock coordination
+| Area | Current behavior | Implication |
+| --- | --- | --- |
+| Public report reads | Stateless HTTP handlers backed by PostgreSQL and Redis | Horizontal read scaling is straightforward if PostgreSQL can absorb the query volume |
+| Recomputation queue | Buffered channel inside the API process | Queue state is not durable across restarts and is local to each replica |
+| Duplicate-trigger protection | Redis scope lock | Multiple replicas can still reject duplicate recompute triggers safely if they share Redis |
+| Cache invalidation | Per-report Redis version keys | Invalidation semantics stay simple even with multiple app replicas |
 
-## Startup Behavior
+The main scaling caveat is recomputation durability. The current design is strong for local development and moderate load, but a durable external queue would be the next step for higher operational demands.
 
-For production-like deployments:
+## Data Durability and Recovery
 
-- Keep `APP_AUTO_MIGRATE=false` and run migrations explicitly in deployment pipeline.
-- Keep `APP_AUTO_SEED=false`.
-- Enable health checks against `/api/v1/health`.
+PostgreSQL is the durable store for:
 
-## Horizontal Scaling Notes
+- raw analytics events
+- report definitions and aggregate window metadata
+- snapshot aggregates
+- recompute history
+- audit entries
 
-- Public report reads can scale horizontally.
-- Recompute worker is in-process; multiple replicas can still run safely due Redis locks, but queue state is local to each replica.
-- For larger scale or strict durability, replace in-process queue with an external queue.
+Redis is safe to treat as disposable because it only holds caches and locks. Recovery planning should therefore focus on PostgreSQL backups, migration discipline, and point-in-time recovery if the service is deployed outside local development.
 
-## Current Recompute Trade-offs
+## Production Hardening Checklist
 
-- In-process queue means no durable backlog across restarts.
-- Full-range recompute favors correctness/readability over minimal compute cost.
-- Locking is scope-based and short-lived; operational retry logic remains API-driven.
+- Provide managed PostgreSQL backups.
+- Run the distroless runtime image or an equivalent minimal artifact.
+- Terminate TLS upstream of the service.
+- Restrict management endpoints at the network edge.
+- Monitor health status, recompute failures, and queue-pressure symptoms.
 
-## Data Backups and Recovery
-
-- PostgreSQL stores source events, snapshots, recompute history, and audit entries.
-- Backup strategy should include point-in-time recovery if deployed in production contexts.
-- Redis data can be treated as disposable cache/lock state.
+More future-facing work is tracked in [Roadmap](roadmap.md).

@@ -1,39 +1,65 @@
 # Security
 
-## Scope
+The service is built for secure-by-default behavior within its current scope: public read-only reporting, protected management endpoints, bounded query execution, and auditable operational actions.
 
-This project targets secure-by-default behavior suitable for a public portfolio backend and local deployment.
+## Related Docs
 
-## API Access Controls
+- [README](../README.md)
+- [API Overview](api-overview.md)
+- [Deployment Notes](deployment-notes.md)
 
-- Public access is limited to read-only report and health endpoints.
-- Management operations (`/recomputations`, `/audit-entries`) require a management API key.
-- Key validation uses constant-time comparison.
+## Implemented Controls
 
-## Input Validation and Query Bounds
+| Control area | Current implementation |
+| --- | --- |
+| Management auth | Recomputation and audit endpoints require `X-Management-Key` or `Authorization: Bearer <key>`. |
+| Secret comparison | Management key validation uses constant-time comparison. |
+| Query bounds | Date ranges are limited by `MAX_REPORT_RANGE_DAYS`; `limit` is capped at `100`; `offset` must be non-negative. |
+| Input validation | Windows, dates, JSON request bodies, and allowlisted sort fields are validated before application execution. |
+| SQL safety | Repository queries are parameterized; dynamic sorting is restricted to an allowlist. |
+| Duplicate-trigger protection | Redis locks prevent concurrent recompute requests for the same report, window, and date range. |
+| Auditability | Management actions and worker outcomes are persisted in `audit_entries`. |
+| Error shaping | API responses avoid stack traces and return stable error codes. |
 
-- Date inputs must follow `YYYY-MM-DD`.
-- Date range is bounded by `MAX_REPORT_RANGE_DAYS`.
-- Pagination is constrained to a safe upper bound (`100`).
-- Sort fields are allowlisted.
-- Unsupported windows/breakdowns are rejected with `400`.
+## Access Model
 
-## Recompute Safety Controls
+The access boundary is intentionally simple:
 
-- Redis lock prevents duplicate recompute requests for identical scope.
-- Expiring lock protects against abandoned lock state.
-- Recompute activity is persisted in `recompute_runs` and `audit_entries`.
+- report catalog and report execution endpoints are public and read-only
+- recomputation and audit visibility are management-only
+- the current implementation uses a single shared management key rather than user, tenant, or role-specific credentials
 
-## Data and Error Handling
+That model is appropriate for the current repository scope, but it is not positioned as a production-grade multi-tenant authorization system.
 
-- SQL uses parameterized queries.
-- Error payloads avoid stack traces and internal details.
-- Sensitive management operations are auditable.
+## Validation and Query Safety
 
-## Operational Hardening Recommendations
+The main resource-protection measures in the current implementation are:
 
-- Rotate `MANAGEMENT_API_KEY` regularly.
-- Restrict management endpoint access at network perimeter.
-- Add TLS termination for non-local deployments.
-- Add request-rate limiting if internet-exposed.
-- Add centralized secret management for production environments.
+- bounded date windows through `MAX_REPORT_RANGE_DAYS`
+- capped pagination for list and report queries
+- allowlisted `sort` fields on report listing
+- strict `day` and `week` window validation
+- strict JSON decoding for recompute requests with unknown fields rejected
+
+These checks are important because the service deliberately exposes analytical queries and recompute triggers over HTTP.
+
+## Operational Considerations
+
+Security posture depends on deployment choices as well as code behavior. For non-local deployments:
+
+- rotate `MANAGEMENT_API_KEY` and never rely on the default fallback value
+- terminate TLS at the edge or inside the platform network
+- restrict management endpoints at the network perimeter
+- use secret management rather than static env files where possible
+- add rate limiting if the public read surface is internet-exposed
+
+## Current Limitations
+
+The current design is intentionally honest about what it does not yet provide:
+
+- no tenant-aware or user-aware authorization model
+- no request-rate limiting in the HTTP layer
+- no dedicated secret rotation workflow
+- no immutable audit export or tamper-evident log chain
+
+These are reasonable next steps for a larger deployment, but they are outside the present repository scope.

@@ -1,99 +1,72 @@
 # Domain Model
 
-## Core Entities
+The domain model is intentionally small and practical. The service keeps raw events, report metadata, read-optimized snapshots, recompute execution state, and audit history in a shape that is easy to inspect from both code and SQL.
 
-### ReportDefinition
+## Related Docs
 
-Describes a report that can be queried through the API.
+- [README](../README.md)
+- [Architecture](architecture.md)
+- [API Overview](api-overview.md)
 
-- `slug`
-- `name`
-- `description`
-- `cache_ttl_seconds`
-- `default_window`
-- `supported_filters`
+## Core Objects
 
-### AggregateWindow
+| Object | Backing table | Purpose | Key fields |
+| --- | --- | --- | --- |
+| Event source | `event_sources` | Catalogs upstream providers represented in seeded analytics data | `slug`, `provider_name`, `description`, `is_active` |
+| Analytics event | `analytics_events` | Stores raw event records that recomputation reads from | `source_id`, `entity_id`, `status`, `processing_ms`, `amount_cents`, `occurred_at`, `payload` |
+| Report definition | `report_definitions` | Describes the public report catalog | `slug`, `name`, `description`, `cache_ttl_seconds`, `default_window`, `supported_filters` |
+| Aggregate window | `aggregate_windows` | Describes allowed windows and operational metadata per report | `window_name`, `retention_days`, `refresh_interval_minutes`, `is_default` |
+| Metric snapshot | `metric_snapshots` | Stores precomputed analytics rows used by report endpoints | `report_slug`, `window_name`, `bucket_start`, `dimension_key`, `dimension_value`, `metric_name`, `metric_value`, `run_id` |
+| Recompute run | `recompute_runs` | Tracks the execution lifecycle of a manual snapshot rebuild | `status`, `date_from`, `date_to`, `requested_by`, `summary`, `error_message` |
+| Audit entry | `audit_entries` | Persists operational activity for management endpoints and worker outcomes | `actor`, `action`, `resource_type`, `resource_id`, `metadata`, `created_at` |
 
-Defines supported aggregation windows and retention expectations per report.
+## Report Catalog
 
-- `report_slug`
-- `window` (`day`, `week`)
-- `retention_days`
-- `refresh_interval_minutes`
-- `is_default`
+All current reports are backed by the same `metric_snapshots` table. What changes by report is the dimension being aggregated and the query shape exposed by the API.
 
-### MetricSnapshot
+| Report slug | Snapshot dimension | Effective API behavior | Supported windows |
+| --- | --- | --- | --- |
+| `volume-by-period` | `source` | Omit `breakdown` or use `period` for period totals; use `breakdown=source` for period plus source rows; optional `source` filter narrows the dimension | `day`, `week` |
+| `status-counts` | `status` | Omit `breakdown` or use `status` for totals by status; use `breakdown=period` for period plus status rows; optional `status` filter narrows the dimension | `day`, `week` |
+| `top-entities` | `entity_id` | Returns ranked entities over the requested range with `limit` and `offset` pagination | `day`, `week` |
 
-Stores precomputed analytics values used by report endpoints.
+## Snapshot Lineage
 
-- `report_slug`
-- `window`
-- `bucket_start`
-- `dimension_key`
-- `dimension_value`
-- `metric_name`
-- `metric_value`
-- `run_id` (nullable)
+```mermaid
+flowchart LR
+    Definitions["`report_definitions` + `aggregate_windows`"] --> Recompute["Recompute SQL"]
+    Events["`analytics_events`"] --> Recompute
+    Recompute --> Snapshots["`metric_snapshots`"]
+    Recompute --> Runs["`recompute_runs`"]
+    Recompute --> Audit["`audit_entries`"]
+    Snapshots --> ReportAPI["`GET /reports/{slug}/run`"]
+```
 
-### RecomputeRun
+`run_id` on `metric_snapshots` creates lineage between the materialized rows and the recompute execution that generated them.
 
-Tracks manual recompute execution lifecycle.
+## Recompute Run Lifecycle
 
-- `id`
-- `report_slug`
-- `window`
-- `date_from`, `date_to`
-- `requested_by`
-- `status` (`pending`, `running`, `completed`, `failed`)
-- `summary`
-- `error_message`
+```mermaid
+stateDiagram-v2
+    [*] --> Pending
+    Pending --> Running: worker starts processing
+    Running --> Completed: summary stored
+    Running --> Failed: error stored
+    Completed --> [*]
+    Failed --> [*]
+```
 
-### AuditEntry
+The current lifecycle states are:
 
-Records management and operational events.
+- `pending`: the management request passed validation and the run record was created
+- `running`: a worker goroutine is actively rebuilding the requested snapshot range
+- `completed`: snapshot rebuild finished and summary counts were stored
+- `failed`: snapshot rebuild or run finalization failed and the error was recorded
 
-- `actor`
-- `action`
-- `resource_type`
-- `resource_id`
-- `metadata`
-- `created_at`
+## Modeling Notes
 
-### EventSource
-
-Represents an analytics data source/provider.
-
-- `slug`
-- `provider_name`
-- `description`
-- `is_active`
-
-### AnalyticsEvent
-
-Raw source event used for recompute and analytics derivation.
-
-- `source_id`
-- `external_ref`
-- `entity_id`
-- `status`
-- `processing_ms`
-- `amount_cents`
-- `occurred_at`
-- `payload`
-
-## Report Semantics
-
-Implemented report slugs:
-
-1. `volume-by-period`
-2. `status-counts`
-3. `top-entities`
-
-All three read from `metric_snapshots`, populated by recompute runs.
-
-## Lifecycle Notes
-
-- Reports are read-mostly.
-- Recompute updates snapshot rows for a bounded scope.
-- Recompute creates auditable state transitions and cache invalidation side effects.
+- Snapshot buckets are computed with PostgreSQL `date_trunc`, so daily and weekly windows are aligned in the database rather than in application code.
+- `metric_snapshots` enforces uniqueness on `(report_slug, window_name, bucket_start, dimension_key, dimension_value, metric_name)`.
+- Recompute deletes and rebuilds only the affected bucket range for the requested report and window.
+- Audit metadata is stored as `jsonb`, which keeps operational context flexible without widening the table for every new event detail.
+- Seed data creates 25,000 events and then precomputes day and week snapshots for all three reports.
